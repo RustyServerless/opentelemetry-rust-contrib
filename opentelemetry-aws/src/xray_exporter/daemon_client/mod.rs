@@ -176,7 +176,7 @@ impl XrayDaemonClient {
         segment_document.to_writer(&mut guard.buf);
 
         // Send
-        self.socket.send(&guard.buf)?;
+        self.socket.send(guard.buf)?;
 
         Ok(())
     }

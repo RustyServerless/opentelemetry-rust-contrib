@@ -1,5 +1,14 @@
 # OpenTelemetry AWS
 
+> ⚠️⚠️⚠️ **WARNING: THIS IS A TEMPORARY FORK** ⚠️⚠️⚠️
+>
+> This crate is a temporary fork of `opentelemetry-aws`. It will be yanked/deprecated once upstream PR #549 is merged.
+> **DO NOT USE IN PRODUCTION**
+>
+> See: https://github.com/open-telemetry/opentelemetry-rust-contrib/pull/549
+>
+> ⚠️⚠️⚠️
+
 ![OpenTelemetry — An observability framework for cloud-native software.][splash]
 
 [splash]: https://raw.githubusercontent.com/open-telemetry/opentelemetry-rust/main/assets/logo-text.png
