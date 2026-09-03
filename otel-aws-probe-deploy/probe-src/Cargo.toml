@@ -1,0 +1,20 @@
+[package]
+name = "otel-aws-probe"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "otel-aws-probe"
+path = "src/main.rs"
+
+[dependencies]
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", default-features = false }
+opentelemetry-aws = { git = "https://github.com/RustyServerless/opentelemetry-rust-contrib.git", branch = "wip/aws-resource-detectors", default-features = false, features = [
+    "internal-logs",
+    "detector-aws-ec2",
+    "detector-aws-ecs",
+    "detector-aws-eks",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

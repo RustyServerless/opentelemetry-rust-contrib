@@ -1,0 +1,590 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  otel-aws-probe: exercises the opentelemetry-aws EC2/ECS/EKS resource
+  detectors on five platforms (EC2, ECS-on-EC2, ECS-on-Fargate, EKS-on-EC2,
+  EKS-on-Fargate). Every platform downloads the self-contained Rust probe
+  project from a presigned S3 URL, builds it with cargo, and runs it once with
+  RUST_LOG=debug. All output lands in a single CloudWatch log group.
+
+  The four EC2/ECS platforms run automatically on stack creation.
+  The two EKS platforms need one post-deploy step (run-eks-probes.sh) because
+  CloudFormation cannot apply Kubernetes manifests natively.
+
+# ===========================================================================
+Parameters:
+  ProbeSourceUrl:
+    Type: String
+    NoEcho: true
+    Description: >
+      Presigned HTTPS GET URL to otel-aws-probe.zip. Generate with
+      make-presigned-url.sh. A presigned URL from an assumed-role session
+      expires with that session (~1h); regenerate + update-stack if it lapses.
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the dedicated VPC this stack creates.
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    Description: EC2 type for the bare-EC2 probe and the ECS EC2 capacity.
+
+  EksInstanceType:
+    Type: String
+    Default: t3.xlarge
+    Description: EC2 type for the EKS managed node group.
+
+  KubernetesVersion:
+    Type: String
+    Default: "1.36"
+
+  Al2023AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  EcsAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id
+
+  RustImage:
+    Type: String
+    Default: rust:1-bookworm
+    Description: Container image (cargo+git) used by the ECS tasks.
+
+# ===========================================================================
+Resources:
+
+  # =========================================================================
+  # Dedicated VPC: 2 public + 2 private subnets across two AZs.
+  # Public subnets host the EC2/ECS probes (they get public IPs and reach the
+  # internet via the internet gateway). Private subnets host the EKS node group
+  # and Fargate pods (EKS Fargate profiles require private subnets) and reach
+  # the internet via a single NAT gateway. The EKS control plane spans all four.
+  # =========================================================================
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: otel-aws-probe
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: otel-aws-probe
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # --- Public subnets ------------------------------------------------------
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: otel-aws-probe-public-a
+        - Key: kubernetes.io/role/elb
+          Value: "1"
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: otel-aws-probe-public-b
+        - Key: kubernetes.io/role/elb
+          Value: "1"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: otel-aws-probe-public
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetAAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetA
+
+  PublicSubnetBAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetB
+
+  # --- Private subnets (egress via NAT) ------------------------------------
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: otel-aws-probe-private-a
+        - Key: kubernetes.io/role/internal-elb
+          Value: "1"
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: otel-aws-probe-private-b
+        - Key: kubernetes.io/role/internal-elb
+          Value: "1"
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: otel-aws-probe-private
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetAAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetA
+
+  PrivateSubnetBAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetB
+
+  # --- Shared CloudWatch log group -----------------------------------------
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /otel-aws-probe
+      RetentionInDays: 7
+
+  # =========================================================================
+  # Platform 1 - bare EC2 instance
+  # =========================================================================
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      # AmazonSSMManagedInstanceCore lets the SSM Agent register the instance so
+      # 6-rerun-probes.sh can force a recompile+run via `aws ssm run-command`.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub "${LogGroup.Arn}:*"
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Ec2Role]
+
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: otel-aws-probe bare EC2 (egress only)
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  Ec2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref Al2023AmiId
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        InstanceMetadataTags: enabled
+      # The public subnets set MapPublicIpOnLaunch=true, so the instance gets a
+      # public IP with the classic SubnetId form (the NetworkInterfaces form
+      # trips CloudFormation early property validation).
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroupIds: [!Ref Ec2SecurityGroup]
+      Tags:
+        - Key: Name
+          Value: otel-aws-probe-ec2
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -uxo pipefail
+          exec > /var/log/otel-aws-probe-userdata.log 2>&1
+          # cloud-init runs this without a login environment, so HOME is unset.
+          # Set it before rustup, which installs into $HOME/.cargo.
+          export HOME=/root
+          export GROUP="${LogGroup}"
+          export STREAM="ec2/$(date +%s)"
+          export REGION="${AWS::Region}"
+
+          dnf install -y gcc git python3 unzip tar gzip >/tmp/dnf.log 2>&1
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+
+          cd /root
+          curl -fSL '${ProbeSourceUrl}' -o probe.zip
+          mkdir -p probe && unzip -o probe.zip -d probe
+          cd probe
+          RUST_LOG=debug cargo run --release 2>&1 | tee /root/probe-output.log
+
+          aws logs create-log-stream --region "$REGION" \
+            --log-group-name "$GROUP" --log-stream-name "$STREAM" || true
+          python3 - /root/probe-output.log <<'PY'
+          import json,sys,time,subprocess,os
+          group=os.environ["GROUP"]; stream=os.environ["STREAM"]; region=os.environ["REGION"]
+          lines=[l for l in open(sys.argv[1]).read().splitlines() if l.strip()]
+          now=int(time.time()*1000)
+          events=[{"timestamp":now+i,"message":l[:250000]} for i,l in enumerate(lines)]
+          for i in range(0,len(events),1000):
+              subprocess.run(["aws","logs","put-log-events","--region",region,
+                "--log-group-name",group,"--log-stream-name",stream,
+                "--log-events",json.dumps(events[i:i+1000])],check=False)
+          PY
+
+  # =========================================================================
+  # Shared ECS cluster (hosts both the EC2 and Fargate ECS probes)
+  # =========================================================================
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: otel-aws-probe
+
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: otel-aws-probe ECS tasks (egress only)
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  # --- ECS EC2 capacity (ASG registered to the cluster) --------------------
+  EcsInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+
+  EcsInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref EcsInstanceRole]
+
+  EcsLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref EcsAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt EcsInstanceProfile.Arn }
+        SecurityGroupIds: [!Ref EcsSecurityGroup]
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+          InstanceMetadataTags: enabled
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo "ECS_CLUSTER=${EcsCluster}" >> /etc/ecs/ecs.config
+
+  EcsAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: "1"
+      MaxSize: "1"
+      DesiredCapacity: "1"
+      VPCZoneIdentifier:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      LaunchTemplate:
+        LaunchTemplateId: !Ref EcsLaunchTemplate
+        Version: !GetAtt EcsLaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: otel-aws-probe-ecs-ec2
+          PropagateAtLaunch: true
+
+  # --- Platform 2: ECS on EC2 ---------------------------------------------
+  EcsEc2TaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: otel-aws-probe-ec2
+      NetworkMode: bridge
+      RequiresCompatibilities: [EC2]
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: probe
+          Image: !Ref RustImage
+          Cpu: 1024
+          Memory: 1536
+          Essential: true
+          EntryPoint: ["/bin/bash", "-c"]
+          Command:
+            - >-
+              set -eux;
+              apt-get update && apt-get install -y unzip;
+              curl -fSL "$PROBE_URL" -o /tmp/probe.zip;
+              cd /tmp && unzip -o probe.zip -d probe && cd probe;
+              RUST_LOG=debug cargo run --release;
+              echo "probe finished, sleeping to keep the ECS service stable";
+              sleep 3600
+          Environment:
+            - Name: PROBE_URL
+              Value: !Ref ProbeSourceUrl
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs-ec2
+
+  EcsEc2Service:
+    # Run-once semantics: a service with desired=1 will restart the task, but
+    # that is acceptable for a probe. It also guarantees placement once the ASG
+    # instance has registered.
+    Type: AWS::ECS::Service
+    DependsOn: EcsAutoScalingGroup
+    Properties:
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref EcsEc2TaskDef
+      DesiredCount: 1
+      LaunchType: EC2
+      SchedulingStrategy: REPLICA
+
+  # --- Platform 3: ECS on Fargate -----------------------------------------
+  EcsFargateTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: otel-aws-probe-fargate
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: "1024"
+      Memory: "2048"
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: probe
+          Image: !Ref RustImage
+          Essential: true
+          EntryPoint: ["/bin/bash", "-c"]
+          Command:
+            - >-
+              set -eux;
+              apt-get update && apt-get install -y unzip;
+              curl -fSL "$PROBE_URL" -o /tmp/probe.zip;
+              cd /tmp && unzip -o probe.zip -d probe && cd probe;
+              RUST_LOG=debug cargo run --release;
+              echo "probe finished, sleeping to keep the ECS service stable";
+              sleep 3600
+          Environment:
+            - Name: PROBE_URL
+              Value: !Ref ProbeSourceUrl
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs-fargate
+
+  EcsFargateService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref EcsFargateTaskDef
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnetA
+            - !Ref PublicSubnetB
+          SecurityGroups: [!Ref EcsSecurityGroup]
+
+  # =========================================================================
+  # Platforms 4 & 5 - EKS cluster, node group (EC2) and Fargate profile.
+  # Infra only: the probe Jobs are applied by run-eks-probes.sh post-deploy.
+  # =========================================================================
+  EksClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: eks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  EksCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: otel-aws-probe
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EksClusterRole.Arn
+      # API mode so run-eks-probes.sh can use EKS access entries without editing
+      # aws-auth. The stack creator gets cluster-admin via access entry below.
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+      ResourcesVpcConfig:
+        # Both public and private subnets so the control plane can place ENIs
+        # in either; workloads run in the private subnets.
+        SubnetIds:
+          - !Ref PublicSubnetA
+          - !Ref PublicSubnetB
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+
+  EksNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  EksNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref EksCluster
+      NodeRole: !GetAtt EksNodeRole.Arn
+      # Private subnets: nodes reach the internet via the NAT gateway.
+      Subnets:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      InstanceTypes: [!Ref EksInstanceType]
+      AmiType: AL2023_x86_64_STANDARD
+      ScalingConfig:
+        MinSize: 1
+        MaxSize: 1
+        DesiredSize: 1
+      Labels:
+        otel-aws-probe: node
+
+  EksFargatePodRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: eks-fargate-pods.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSFargatePodExecutionRolePolicy
+
+  EksFargateProfile:
+    Type: AWS::EKS::FargateProfile
+    Properties:
+      ClusterName: !Ref EksCluster
+      FargateProfileName: otel-aws-probe
+      PodExecutionRoleArn: !GetAtt EksFargatePodRole.Arn
+      # Fargate profiles require private subnets.
+      Subnets:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      Selectors:
+        - Namespace: probe-fargate
+
+# ===========================================================================
+Outputs:
+  LogGroupName:
+    Value: !Ref LogGroup
+  EksClusterName:
+    Value: !Ref EksCluster
+  ProbeSourceUrlEcho:
+    Description: Reminder that the presigned URL was supplied at deploy time.
+    Value: "supplied via ProbeSourceUrl parameter (NoEcho)"
